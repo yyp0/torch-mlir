@@ -7046,6 +7046,8 @@ class DecomposeAtenAdaptiveAvgPool2dOp
         loc, rewriter.getI64IntegerAttr(0));
     Value constantOne = rewriter.create<Torch::ConstantIntOp>(
         loc, rewriter.getI64IntegerAttr(1));
+    Value constantTwo = rewriter.create<Torch::ConstantIntOp>(
+        loc, rewriter.getI64IntegerAttr(2));
     Value constantFalse = rewriter.create<Torch::ConstantBoolOp>(loc, false);
     Value constantTrue = rewriter.create<Torch::ConstantBoolOp>(loc, true);
     Value constantNone = rewriter.create<Torch::ConstantNoneOp>(loc);
@@ -7083,7 +7085,7 @@ class DecomposeAtenAdaptiveAvgPool2dOp
       Value finalCond = rewriter.create<Torch::AtenEqIntOp>(
           loc, condAnd,
           rewriter.create<Torch::ConstantIntOp>(loc,
-                                                rewriter.getI64IntegerAttr(2)));
+                                                constantTwo));
 
       rewriter.create<RuntimeAssertOp>(
           loc, finalCond,
