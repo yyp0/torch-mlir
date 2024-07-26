@@ -7056,7 +7056,7 @@ class DecomposeAtenAdaptiveAvgPool2dOp
       Value remainder = rewriter.create<AtenRemainderIntOp>(
           loc, inputHW[i], outputShapeSizesTorchInt[i]);
 
-      // Support cases with fixed stride size.
+      // Filter cases with fixed stride size.
       Value cond1 = rewriter.create<Torch::AtenGtIntOp>(
           loc, rewriter.getType<Torch::BoolType>(), outputShapeSizesTorchInt[i],
           rewriter.create<Torch::AtenMulIntOp>(
@@ -7064,7 +7064,7 @@ class DecomposeAtenAdaptiveAvgPool2dOp
               rewriter.create<Torch::AtenSubIntOp>(
                   loc, outputShapeSizesTorchInt[i], constantOne)));
 
-      // Support cases with fixed kernel size.
+      // Filter cases with fixed kernel size.
       Value cond2 =
           rewriter.create<Torch::AtenEqIntOp>(loc, remainder, constantZero);
       cond2 = rewriter.create<Torch::AtenIntBoolOp>(loc, cond2);
