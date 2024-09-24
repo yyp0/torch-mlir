@@ -1578,25 +1578,82 @@ public:
   LogicalResult
   matchAndRewrite(AtenScaledDotProductAttentionOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    Value mask = op.getAttnMask();
+
+    auto opTy = cast<ValueTensorType>(op.getType()).toBuiltinTensor();
+    auto query = adaptor.getQuery();
+    auto value = adaptor.getValue();
+    auto key = adaptor.getKey();
+    auto mask = adaptor.getAttnMask();
+    auto queryTy = cast<ShapedType>(query.getType());
+    auto valueTy = cast<ShapedType>(value.getType());
+    auto keyTy = cast<ShapedType>(key.getType());
+
     Value dropoutP = op.getDropoutP();
     Value isCausal = op.getIsCausal();
     Value scale = op.getScale();
+    Value enableGQA = op.getEnableGqa();
     Type elementType =
         cast<ShapedType>(adaptor.getQuery().getType()).getElementType();
 
-    // Verify inputs (only support defaults)
-    if (!isa<Torch::NoneType>(mask.getType()))
-      return rewriter.notifyMatchFailure(op.getLoc(),
-                                         "attention masking not supported");
     double dropout;
     if (!matchPattern(dropoutP, m_TorchConstantFloat(&dropout)) ||
         dropout > 0.0)
       return rewriter.notifyMatchFailure(op.getLoc(), "dropout not supported");
+
     bool causal;
-    if (!matchPattern(isCausal, m_TorchConstantBool(&causal)) || causal)
-      return rewriter.notifyMatchFailure(
-          op.getLoc(), "causal attention masking not supported");
+    if (!matchPattern(isCausal, m_TorchConstantBool(&causal)) || causal) {
+      if (!isa<Torch::NoneType>(mask.getType())) {
+        return rewriter.notifyMatchFailure(
+            op.getLoc(), "expected no attention mask when isCausal is true");
+      }
+
+      SmallVector<int64_t> maskStatic;
+      SmallVector<Value> maskDyn;
+      for (int i = 0, s = queryTy.getRank() - 1; i < s; ++i) {
+        maskStatic.push_back(queryTy.getDimSize(i));
+        if (maskStatic.back() == ShapedType::kDynamic)
+          maskDyn.push_back(
+              rewriter.create<tensor::DimOp>(op.getLoc(), query, i));
+      }
+
+      maskStatic.push_back(keyTy.getDimSize(keyTy.getRank() - 2));
+      if (maskStatic.back() == ShapedType::kDynamic)
+        maskDyn.push_back(rewriter.create<tensor::DimOp>(op.getLoc(), key,
+                                                         keyTy.getRank() - 2));
+
+      Type maskType = getElementTypeOrSelf(queryTy);
+      Value emptyMask = rewriter.create<tensor::EmptyOp>(
+          op.getLoc(), maskStatic, maskType, maskDyn);
+
+      Value zero = rewriter.create<arith::ConstantOp>(
+          op.getLoc(),
+          rewriter.getFloatAttr(getElementTypeOrSelf(maskType), 0.0));
+      Value negInf = rewriter.create<arith::ConstantOp>(
+          op.getLoc(),
+          rewriter.getFloatAttr(getElementTypeOrSelf(maskType), -INFINITY));
+
+      mask = rewriter.create<linalg::FillOp>(op.getLoc(), zero, emptyMask)
+                 .getResult(0);
+
+      int64_t rank = cast<ShapedType>(queryTy).getRank();
+      AffineMap maskMap = rewriter.getMultiDimIdentityMap(rank);
+      SmallVector<utils::IteratorType> iteratorTypes(
+          rank, utils::IteratorType::parallel);
+      auto genericOp = rewriter.create<linalg::GenericOp>(
+          op.getLoc(), mask.getType(), ValueRange{}, mask,
+          SmallVector<AffineMap>{maskMap}, iteratorTypes,
+          [&](OpBuilder &b, Location loc, ValueRange args) {
+            Value i = b.create<linalg::IndexOp>(loc, queryTy.getRank() - 2);
+            Value j = b.create<linalg::IndexOp>(loc, queryTy.getRank() - 1);
+
+            Value cond =
+                b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sge, i, j);
+            Value select = b.create<arith::SelectOp>(loc, cond, zero, negInf);
+            b.create<linalg::YieldOp>(loc, select);
+          });
+      mask = genericOp.getResult(0);
+    }
+
     if (!isa<Torch::NoneType>(scale.getType())) {
       double scaleFloat;
       if (!matchPattern(scale, m_TorchConstantFloat(&scaleFloat)) ||
@@ -1604,14 +1661,11 @@ public:
         return rewriter.notifyMatchFailure(op.getLoc(),
                                            "only default scale supported");
     }
-
-    auto opTy = cast<ValueTensorType>(op.getType()).toBuiltinTensor();
-    auto query = adaptor.getQuery();
-    auto value = adaptor.getValue();
-    auto key = adaptor.getKey();
-    auto queryTy = cast<ShapedType>(query.getType());
-    auto valueTy = cast<ShapedType>(value.getType());
-    auto keyTy = cast<ShapedType>(key.getType());
+    bool isGQAEnabled;
+    if (!matchPattern(enableGQA, m_TorchConstantBool(&isGQAEnabled)) ||
+        isGQAEnabled)
+      return rewriter.notifyMatchFailure(
+          op.getLoc(), "grouped query attention not supported");
 
     if (queryTy.getRank() != valueTy.getRank() ||
         queryTy.getRank() != keyTy.getRank())
@@ -1653,6 +1707,9 @@ public:
     query = collapseBatch(query);
     key = collapseBatch(key);
     value = collapseBatch(value);
+    if (!isa<mlir::torch::Torch::NoneType>(mask.getType())) {
+      mask = collapseBatch(mask);
+    }
 
     SmallVector<int64_t> outSizes(cast<ShapedType>(query.getType()).getShape());
     SmallVector<int64_t> valueSizes(
@@ -1666,13 +1723,17 @@ public:
     Value output = createZeroInitTensor(rewriter, op.getLoc(), outSizesDynamic,
                                         elementType);
 
+    SmallVector<Value> inputs = SmallVector<Value>{query, key, value};
+
+    if (!isa<mlir::torch::Torch::NoneType>(mask.getType())) {
+      inputs.push_back(mask);
+    }
+
     // Overwrite with tm_tensor::attention
-    Value attention =
-        rewriter
-            .create<AttentionOp>(loc, outType,
-                                 SmallVector<Value>{query, key, value},
-                                 SmallVector<Value>{output})
-            .getResult()[0];
+    Value attention = rewriter
+                          .create<AttentionOp>(loc, outType, inputs,
+                                               SmallVector<Value>{output})
+                          .getResult()[0];
 
     if (opTy != outType) {
       attention = rewriter.create<tensor::ExpandShapeOp>(loc, opTy, attention,
