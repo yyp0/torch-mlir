@@ -845,6 +845,28 @@ static Value createLinalgPayloadCalculationForElementwiseOp(
       return b.create<arith::SubIOp>(loc, lhs, scaled);
     }
   }
+  if (auto lshiftScalar = dyn_cast<Aten__Lshift__ScalarOp>(op)) {
+    Type dtype =
+        cast<RankedTensorType>(converter->convertType(lshiftScalar.getType()))
+            .getElementType();
+    Value self = convertScalarToDtype(b, loc, payloadArgs[0], dtype);
+    Value other =
+        convertScalarToDtype(b, loc, operands[1], dtype,
+                             /*srcOriginalDtype=*/operands[1].getType(),
+                             /*dstOriginalDtype=*/dtype);
+    return b.create<arith::ShLIOp>(loc, self, other);
+  }
+  if (auto rshiftScalar = dyn_cast<Aten__Rshift__ScalarOp>(op)) {
+    Type dtype =
+        cast<RankedTensorType>(converter->convertType(rshiftScalar.getType()))
+            .getElementType();
+    Value self = convertScalarToDtype(b, loc, payloadArgs[0], dtype);
+    Value other =
+        convertScalarToDtype(b, loc, operands[1], dtype,
+                             /*srcOriginalDtype=*/operands[1].getType(),
+                             /*dstOriginalDtype=*/dtype);
+    return b.create<arith::ShRUIOp>(loc, self, other);
+  }
   if (auto subScalar = dyn_cast<AtenSubScalarOp>(op)) {
     Type dtype =
         cast<RankedTensorType>(converter->convertType(subScalar.getType()))
@@ -1260,29 +1282,6 @@ static Value createLinalgPayloadCalculationForElementwiseOp(
     return createRemainderPayload(b, loc, converter, payloadArgs, remTensor,
                                   operands);
   }
-  if (auto fmod = dyn_cast<AtenFmodTensorOp>(op)) {
-    Type newResultType =
-        cast<RankedTensorType>(converter->convertType(fmod.getType()))
-            .getElementType();
-
-    Value self = convertScalarToDtype(b, loc, payloadArgs[0], newResultType);
-    Value other = convertScalarToDtype(b, loc, payloadArgs[1], newResultType);
-    Value result;
-
-    if (isa<mlir::FloatType>(newResultType)) {
-      Value n = b.create<arith::DivFOp>(loc, self, other);
-      n = b.create<math::TruncOp>(loc, n);
-      Value n_y = b.create<arith::MulFOp>(loc, n, other);
-      result = b.create<arith::SubFOp>(loc, self, n_y);
-    } else if (isa<mlir::IntegerType>(newResultType)) {
-      Value n = b.create<arith::DivSIOp>(loc, self, other);
-      Value n_y = b.create<arith::MulIOp>(loc, n, other);
-      result = b.create<arith::SubIOp>(loc, self, n_y);
-    } else {
-      fmod.emitError("Unsupported type encountered for AtenFmodTensorOp.");
-    }
-    return result;
-  }
   if (auto reciprocal = dyn_cast<AtenReciprocalOp>(op)) {
     Type dtype =
         cast<RankedTensorType>(converter->convertType(reciprocal.getType()))
@@ -1506,6 +1505,48 @@ static Value createLinalgPayloadCalculationForElementwiseOp(
     return value;
   }
 
+  if (auto isClose = dyn_cast<AtenIscloseOp>(op)) {
+    double rtol, atol;
+    bool equalNan;
+    if (!matchPattern(isClose.getRtol(), m_TorchConstantFloat(&rtol))) {
+      isClose.emitError("rtol must be a scalar constant");
+      return nullptr;
+    }
+    if (!matchPattern(isClose.getAtol(), m_TorchConstantFloat(&atol))) {
+      isClose.emitError("atol must be a scalar constant");
+      return nullptr;
+    }
+    if (!matchPattern(isClose.getEqualNan(), m_TorchConstantBool(&equalNan))) {
+      isClose.emitError("unimplemented: equal_nan is expected to be false");
+      return nullptr;
+    }
+    auto lhsType = mlir::dyn_cast<mlir::FloatType>(payloadArgs[0].getType());
+    auto rhsType = mlir::dyn_cast<mlir::FloatType>(payloadArgs[1].getType());
+    if (!lhsType || !rhsType) {
+      isClose.emitError("unimplemented: only FP element type is supported");
+      return nullptr;
+    }
+    // Choose the widest float type as compute type.
+    auto computeType =
+        lhsType.getWidth() > rhsType.getWidth() ? lhsType : rhsType;
+    computeType = computeType.getWidth() >= 32 ? computeType : b.getF32Type();
+    auto cvtArg0 = convertScalarToDtype(b, loc, payloadArgs[0], computeType);
+    auto cvtArg1 = convertScalarToDtype(b, loc, payloadArgs[1], computeType);
+    // Reference to the definition of torch.isclose:
+    //   ∣input − other∣ <= atol + rtol × ∣other∣
+    auto diff = b.create<arith::SubFOp>(loc, computeType, cvtArg0, cvtArg1);
+    auto absDiff = b.create<math::AbsFOp>(loc, computeType, diff);
+    auto cstRtol =
+        b.create<arith::ConstantOp>(loc, b.getFloatAttr(computeType, rtol));
+    auto absOther = b.create<math::AbsFOp>(loc, computeType, cvtArg1);
+    auto mul = b.create<arith::MulFOp>(loc, computeType, cstRtol, absOther);
+    auto cstAtol =
+        b.create<arith::ConstantOp>(loc, b.getFloatAttr(computeType, atol));
+    auto threshold = b.create<arith::AddFOp>(loc, computeType, cstAtol, mul);
+    return b.create<arith::CmpFOp>(loc, arith::CmpFPredicate::ULE, absDiff,
+                                   threshold);
+  }
+
   op->emitError("unimplemented lowering in "
                 "createLinalgPayloadCalculationForElementwiseOp");
   return nullptr;
@@ -1548,23 +1589,24 @@ public:
              AtenErfOp, AtenSqrtOp, AtenFloorOp, AtenPowScalarOp,
              AtenPowTensorScalarOp, AtenPowTensorTensorOp, AtenLog2Op,
              AtenLog10Op, AtenLog1pOp, AtenRsqrtOp, AtenDivScalarOp,
-             AtenRemainderScalarOp, AtenRemainderTensorOp, AtenFmodTensorOp,
-             AtenAbsOp, AtenReciprocalOp, AtenBitwiseAndTensorOp,
-             AtenBitwiseAndScalarOp, AtenBitwiseOrTensorOp,
-             AtenBitwiseXorTensorOp, AtenBitwiseLeftShiftTensorOp,
-             AtenBitwiseRightShiftTensorOp, AtenGtScalarOp, AtenGeScalarOp,
-             AtenEqScalarOp, AtenLtScalarOp, AtenLeScalarOp, AtenWhereSelfOp,
-             AtenCeilOp, AtenGtTensorOp, AtenGeTensorOp, AtenEqTensorOp,
-             AtenNeTensorOp, AtenLtTensorOp, AtenLeTensorOp, AtenSubScalarOp,
-             AtenAddScalarOp, AtenThresholdOp, AtenThresholdBackwardOp,
-             AtenHardtanhBackwardOp, AtenCloneOp, AtenSinOp, AtenCosOp,
-             AtenNeScalarOp, AtenNegOp, AtenMaskedFillTensorOp, AtenLogicalOrOp,
-             AtenLogicalAndOp, AtenLogicalXorOp, AtenLogicalNotOp, AtenIsinfOp,
-             AtenTriuOp, AtenTrilOp, AtenBitwiseNotOp, AtenRoundOp,
-             AtenFillScalarOp, AtenFillTensorOp, AtenAtanOp, AtenAcosOp,
-             AtenAtanhOp, AtenAcoshOp, AtenAsinOp, AtenAsinhOp, AtenRealOp,
-             AtenImagOp, AtenDequantizeSelfOp, AtenDequantizeTensorOp,
-             AtenQuantizePerTensorOp>(op))
+             AtenRemainderScalarOp, AtenRemainderTensorOp, AtenAbsOp,
+             AtenReciprocalOp, AtenBitwiseAndTensorOp, AtenBitwiseAndScalarOp,
+             AtenBitwiseOrTensorOp, AtenBitwiseXorTensorOp,
+             AtenBitwiseLeftShiftTensorOp, AtenBitwiseRightShiftTensorOp,
+             Aten__Lshift__ScalarOp, Aten__Rshift__ScalarOp, AtenGtScalarOp,
+             AtenGeScalarOp, AtenEqScalarOp, AtenLtScalarOp, AtenLeScalarOp,
+             AtenWhereSelfOp, AtenCeilOp, AtenGtTensorOp, AtenGeTensorOp,
+             AtenEqTensorOp, AtenNeTensorOp, AtenLtTensorOp, AtenLeTensorOp,
+             AtenSubScalarOp, AtenAddScalarOp, AtenThresholdOp,
+             AtenThresholdBackwardOp, AtenHardtanhBackwardOp, AtenCloneOp,
+             AtenSinOp, AtenCosOp, AtenNeScalarOp, AtenNegOp,
+             AtenMaskedFillTensorOp, AtenLogicalOrOp, AtenLogicalAndOp,
+             AtenLogicalXorOp, AtenLogicalNotOp, AtenIsinfOp, AtenTriuOp,
+             AtenTrilOp, AtenBitwiseNotOp, AtenRoundOp, AtenFillScalarOp,
+             AtenFillTensorOp, AtenAtanOp, AtenAcosOp, AtenAtanhOp, AtenAcoshOp,
+             AtenAsinOp, AtenAsinhOp, AtenRealOp, AtenImagOp,
+             AtenDequantizeSelfOp, AtenDequantizeTensorOp,
+             AtenQuantizePerTensorOp, AtenIscloseOp>(op))
       return rewriter.notifyMatchFailure(op, "not a supported elementwise op");
 
     if (failed(verifyLinalgCompatibleTypes(op, rewriter)))
@@ -2431,9 +2473,7 @@ public:
     Location loc = op->getLoc();
     Type int64type = rewriter.getI64Type();
     Type floatType = rewriter.getF32Type();
-    Value zeroIndex = rewriter.create<arith::ConstantIndexOp>(loc, 0);
     Value oneIndex = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-    Value twoIndex = rewriter.create<arith::ConstantIndexOp>(loc, 2);
     Value zeroFloat = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getFloatAttr(floatType, 0.0));
     Value oneFloat = rewriter.create<arith::ConstantOp>(
@@ -2442,7 +2482,6 @@ public:
         loc, rewriter.getFloatAttr(floatType, 2.0));
     Value input = adaptor.getInput();
     auto inputType = cast<RankedTensorType>(input.getType());
-    auto inputShape = inputType.getShape();
     Value innerDim0a = rewriter.create<tensor::DimOp>(loc, input, 2);
     Value innerDim1a = rewriter.create<tensor::DimOp>(loc, input, 3);
     Value innerDim0b =
@@ -2463,42 +2502,21 @@ public:
         rewriter.create<arith::DivFOp>(loc, innerDim1d, twoFloat);
     Value grid = adaptor.getGrid();
     auto gridType = cast<RankedTensorType>(grid.getType());
-    auto gridShape = gridType.getShape();
     auto gridRank = gridType.getRank();
-    SmallVector<Value> extractGridOffsets0(gridRank, zeroIndex);
-    SmallVector<Value> extractGridShape = getTensorSizes(rewriter, loc, grid);
-    SmallVector<Value> extractGridStride(gridRank, oneIndex);
-    int64_t lastGridDim = gridRank - 1;
-    extractGridShape[lastGridDim] = oneIndex;
-    extractGridStride[lastGridDim] = twoIndex;
-    SmallVector<Value> extractGridOffsets1(gridRank, zeroIndex);
-    extractGridOffsets1[lastGridDim] = oneIndex;
-    SmallVector<int64_t> gridShapeExtracted(gridShape);
-    gridShapeExtracted.back() = 1;
-    SmallVector<int64_t> gridShapeCollapsed{gridShape[0], gridShape[1],
-                                            gridShape[2]};
-    auto grid0 = rewriter.create<tensor::ExtractSliceOp>(
-        loc, grid, extractGridOffsets0, extractGridShape, extractGridStride);
-    auto grid1 = rewriter.create<tensor::ExtractSliceOp>(
-        loc, grid, extractGridOffsets1, extractGridShape, extractGridStride);
-    SmallVector<ReassociationIndices> associations{ReassociationIndices{0},
-                                                   ReassociationIndices{1},
-                                                   ReassociationIndices{2, 3}};
-    auto gridCollapsed0 =
-        rewriter.create<tensor::CollapseShapeOp>(loc, grid0, associations);
-    auto gridCollapsed1 =
-        rewriter.create<tensor::CollapseShapeOp>(loc, grid1, associations);
-    AffineMap gridMap = AffineMap::get(4, 0,
-                                       {rewriter.getAffineDimExpr(0),
-                                        rewriter.getAffineDimExpr(2),
-                                        rewriter.getAffineDimExpr(3)},
-                                       op->getContext());
-    SmallVector<AffineMap> gridMaps{gridMap, gridMap,
-                                    rewriter.getMultiDimIdentityMap(gridRank)};
+    SmallVector<AffineMap> gridMaps{
+        AffineMap::get(
+            4, 0,
+            {rewriter.getAffineDimExpr(0), rewriter.getAffineDimExpr(2),
+             rewriter.getAffineDimExpr(3), rewriter.getAffineConstantExpr(0)},
+            op->getContext()),
+        AffineMap::get(
+            4, 0,
+            {rewriter.getAffineDimExpr(0), rewriter.getAffineDimExpr(2),
+             rewriter.getAffineDimExpr(3), rewriter.getAffineConstantExpr(1)},
+            op->getContext()),
+        rewriter.getMultiDimIdentityMap(inputType.getRank())};
     SmallVector<utils::IteratorType> gridIterators(
         gridRank, utils::IteratorType::parallel);
-    SmallVector<int64_t> resultShape{inputShape[0], inputShape[1], gridShape[1],
-                                     gridShape[2]};
     auto lambdaExtract = [](OpBuilder &b, Location loc, Value input, Value idxA,
                             Value idxB, Value idxC, Value idxD) -> Value {
       SmallVector<Value> index{idxA, idxB, idxC, idxD};
@@ -2539,22 +2557,22 @@ public:
 
     auto resultType = cast<RankedTensorType>(
         getTypeConverter()->convertType(op.getResult().getType()));
-    SmallVector<Value> resultSize{};
-    if (resultType.isDynamicDim(0))
-      resultSize.push_back(rewriter.create<tensor::DimOp>(loc, input, 0));
-    if (resultType.isDynamicDim(1))
-      resultSize.push_back(rewriter.create<tensor::DimOp>(loc, input, 1));
-    if (resultType.isDynamicDim(2))
-      resultSize.push_back(rewriter.create<tensor::DimOp>(loc, grid, 1));
-    if (resultType.isDynamicDim(3))
-      resultSize.push_back(rewriter.create<tensor::DimOp>(loc, grid, 2));
     Value alignCorners = adaptor.getAlignCorners();
     Value interMode = adaptor.getInterpolationMode();
-    Value resultFinal =
-        rewriter.create<tensor::EmptyOp>(loc, resultType, resultSize);
+    SmallVector<Value> dynamicSizes{};
+    if (resultType.isDynamicDim(0))
+      dynamicSizes.push_back(rewriter.create<tensor::DimOp>(loc, input, 0));
+    if (resultType.isDynamicDim(1))
+      dynamicSizes.push_back(rewriter.create<tensor::DimOp>(loc, input, 1));
+    if (resultType.isDynamicDim(2))
+      dynamicSizes.push_back(rewriter.create<tensor::DimOp>(loc, grid, 1));
+    if (resultType.isDynamicDim(3))
+      dynamicSizes.push_back(rewriter.create<tensor::DimOp>(loc, grid, 2));
+    tensor::EmptyOp emptyOp =
+        rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicSizes);
     auto sGrid = rewriter.create<linalg::GenericOp>(
-        loc, TypeRange{resultType}, ValueRange{gridCollapsed0, gridCollapsed1},
-        ValueRange(resultFinal), gridMaps, gridIterators,
+        loc, TypeRange{resultType}, ValueRange{grid, grid}, ValueRange(emptyOp),
+        gridMaps, gridIterators,
         [&](OpBuilder &b, Location loc, ValueRange args) {
           Value gr0 = args[1];
           Value gr1 = args[0];
@@ -3032,11 +3050,28 @@ public:
     Value cstZeroF = getConstant(rewriter, loc, 0, elemTy);
     // get some shapes
     SmallVector<int64_t> inputShape(inputType.getShape());
+
     SmallVector<int64_t> sliceShape(inputShape);
-    sliceShape.pop_back();
-    SmallVector<int64_t> diagShape({isBatched ? inputType.getShape()[0] : 1});
+    sliceShape[sliceShape.size() - 2] = 1;
+
+    SmallVector<int64_t> diagShape(inputType.getShape());
+    diagShape[diagShape.size() - 2] = 1;
+    diagShape[diagShape.size() - 1] = 1;
+
+    ArrayRef<int64_t> diagCollapseShape(diagShape);
+    diagCollapseShape = diagCollapseShape.drop_back();
+
     auto sliceTy = RankedTensorType::get(sliceShape, elemTy);
     auto diagTy = RankedTensorType::get(diagShape, elemTy);
+    auto diagCollapseTy = RankedTensorType::get(diagCollapseShape, elemTy);
+
+    SmallVector<ReassociationIndices> diagReassociations;
+    diagReassociations.reserve(diagCollapseShape.size());
+    int64_t diagRank = diagCollapseShape.size();
+    for (int i = 0, s = diagRank - 1; i < s; ++i)
+      diagReassociations.push_back(ReassociationIndices{i});
+    diagReassociations.push_back(ReassociationIndices{diagRank - 1, diagRank});
+
     // get some sizes
     SmallVector<Value> inputSizes = getTensorSizes(rewriter, loc, input);
     Value chDim = isBatched ? inputSizes[0] : cstOne;
@@ -3072,6 +3107,10 @@ public:
           // offsets = [0, row, row], sizes = [C, 1, 1] -> diag(row,row)
           Value diag = b.create<tensor::ExtractSliceOp>(
               loc, diagTy, vals[0], offsets, sizes, strides);
+
+          Value diagCollapse = b.create<tensor::CollapseShapeOp>(
+              loc, diagCollapseTy, diag, diagReassociations);
+
           SmallVector<OpFoldResult> diagOffsets(inputRank - 1, cstZeroFold);
           diagOffsets.back() = row;
           SmallVector<OpFoldResult> diagStrides(inputRank - 1, cstOneFold);
@@ -3079,7 +3118,7 @@ public:
           diagSizes.back() = cstOneFold;
           // offsets = [0, row], sizes = [C, 1] insert to [C,N]
           Value updatedDiags = b.create<tensor::InsertSliceOp>(
-              loc, diag, vals[1], diagOffsets, diagSizes, diagStrides);
+              loc, diagCollapse, vals[1], diagOffsets, diagSizes, diagStrides);
           // the subpivot matrix column size, as a Value, is matDim - row -
           // cstOne. This can't be statically converted to an int64_t, since row
           // is the loop index, so this is left as a dynamic dim.
@@ -3117,10 +3156,15 @@ public:
           if (isBatched) {
             rowIterator.push_back(allDims[1]);
             colIterator.push_back(allDims[0]);
+            colIterator.push_back(rewriter.getAffineConstantExpr(0));
             colIterator.push_back(allDims[2]);
             batchIterator.push_back(allDims[0]);
+            batchIterator.push_back(getAffineConstantExpr(0, context));
+            batchIterator.push_back(getAffineConstantExpr(0, context));
           } else {
+            colIterator.push_back(rewriter.getAffineConstantExpr(0));
             colIterator.push_back(allDims[1]);
+            batchIterator.push_back(getAffineConstantExpr(0, context));
             batchIterator.push_back(getAffineConstantExpr(0, context));
           }
           SmallVector<AffineMap> indexingMaps;
@@ -3183,6 +3227,10 @@ public:
     offsets.pop_back();
     strides.pop_back();
     sizes.pop_back();
+
+    lastDiag = rewriter.create<tensor::CollapseShapeOp>(
+        loc, diagCollapseTy, lastDiag, diagReassociations);
+
     Value allDiags = rewriter.create<tensor::InsertSliceOp>(
         loc, lastDiag, allDiagsExceptLast, offsets, sizes, strides);
     // linalg generic to do reduce prod for allDiags along back dim.
@@ -3193,7 +3241,8 @@ public:
                                       : getAffineConstantExpr(0, context);
     indexingMaps.push_back(AffineMap::get(inputRank - 1, 0, resultExpr));
     SmallVector<utils::IteratorType> iteratorTypes(
-        inputRank - 1, utils::IteratorType::parallel);
+        inputRank - 2, utils::IteratorType::parallel);
+    iteratorTypes.push_back(utils::IteratorType::reduction);
     Value initDet = createInitTensor(rewriter, loc, ValueRange{chDim}, elemTy,
                                      getConstant(rewriter, loc, 1.0, elemTy));
     Value determinant =
@@ -3213,10 +3262,77 @@ public:
                                                   determinant);
       return success();
     }
-    Value detVal = rewriter.create<tensor::ExtractOp>(
-        loc, determinant, SmallVector<Value>(1, cstZero));
-    rewriter.replaceOpWithNewOp<tensor::FromElementsOp>(op, newResultType,
-                                                        ValueRange{detVal});
+
+    determinant = rewriter.create<tensor::CollapseShapeOp>(
+        loc, newResultType, determinant,
+        llvm::ArrayRef<ReassociationIndices>{});
+    rewriter.replaceOp(op, ValueRange{determinant});
+    return success();
+  }
+};
+} // namespace
+
+namespace {
+class ConvertAtenPolarOp : public OpConversionPattern<AtenPolarOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(AtenPolarOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+
+    if (failed(verifyLinalgCompatibleTypes(op, rewriter)))
+      return failure();
+
+    Location loc = op.getLoc();
+    const TypeConverter *typeConverter = getTypeConverter();
+    MLIRContext *context = rewriter.getContext();
+
+    Value absTensor = adaptor.getAbs();
+    Value angleTensor = adaptor.getAngle();
+
+    RankedTensorType resultType =
+        cast<RankedTensorType>(typeConverter->convertType(op.getType()));
+    auto elementType = resultType.getElementType();
+
+    SmallVector<Value> resultShape;
+    for (int64_t i = 0; i < resultType.getRank(); i++) {
+      auto currentDimSize = rewriter.create<tensor::DimOp>(loc, absTensor, i);
+      resultShape.push_back(currentDimSize);
+    }
+
+    Value outTensor = rewriter.create<tensor::EmptyOp>(
+        loc, getAsOpFoldResult(resultShape), elementType);
+
+    SmallVector<AffineExpr> outputExpr;
+    for (unsigned i = 0; i < resultType.getRank(); i++) {
+      outputExpr.push_back(getAffineDimExpr(i, context));
+    }
+
+    AffineMap identityMap =
+        AffineMap::get(resultType.getRank(), 0, outputExpr, op->getContext());
+
+    SmallVector<AffineMap> indexingMaps{identityMap, identityMap, identityMap};
+    SmallVector<utils::IteratorType> iteratorTypes(
+        resultType.getRank(), utils::IteratorType::parallel);
+    auto complexVar =
+        rewriter
+            .create<linalg::GenericOp>(
+                loc, outTensor.getType(), ValueRange{absTensor, angleTensor},
+                outTensor, indexingMaps, iteratorTypes,
+                [&](OpBuilder &b, Location loc, ValueRange args) {
+                  // out = abs⋅cos(angle) + abs⋅sin(angle)⋅j
+                  Value abs = args[0];
+                  Value angle = args[1];
+                  Value realVal = b.create<math::CosOp>(loc, angle);
+                  Value imagVal = b.create<math::SinOp>(loc, angle);
+                  realVal = b.create<arith::MulFOp>(loc, abs, realVal);
+                  imagVal = b.create<arith::MulFOp>(loc, abs, imagVal);
+                  Value complexVal = b.create<complex::CreateOp>(
+                      loc, elementType, realVal, imagVal);
+                  b.create<linalg::YieldOp>(loc, complexVal);
+                })
+            .getResult(0);
+    rewriter.replaceOpWithNewOp<tensor::CastOp>(op, resultType, complexVar);
     return success();
   }
 };
@@ -3238,17 +3354,18 @@ void mlir::torch::torch_to_linalg::populateUncategorizedPatternsAndLegality(
       AtenLog1pOp, AtenRsqrtOp, AtenAbsOp, AtenReciprocalOp,
       AtenBitwiseAndTensorOp, AtenBitwiseAndScalarOp, AtenBitwiseOrTensorOp,
       AtenBitwiseXorTensorOp, AtenBitwiseLeftShiftTensorOp,
-      AtenBitwiseRightShiftTensorOp, AtenGtScalarOp, AtenGeScalarOp,
-      AtenEqScalarOp, AtenLtScalarOp, AtenLeScalarOp, AtenWhereSelfOp,
-      AtenGtTensorOp, AtenGeTensorOp, AtenEqTensorOp, AtenNeTensorOp,
-      AtenLtTensorOp, AtenLeTensorOp, AtenThresholdOp, AtenThresholdBackwardOp,
+      AtenBitwiseRightShiftTensorOp, Aten__Lshift__ScalarOp,
+      Aten__Rshift__ScalarOp, AtenGtScalarOp, AtenGeScalarOp, AtenEqScalarOp,
+      AtenLtScalarOp, AtenLeScalarOp, AtenWhereSelfOp, AtenGtTensorOp,
+      AtenGeTensorOp, AtenEqTensorOp, AtenNeTensorOp, AtenLtTensorOp,
+      AtenLeTensorOp, AtenThresholdOp, AtenThresholdBackwardOp,
       AtenHardtanhBackwardOp, AtenCloneOp, AtenSinOp, AtenCosOp, AtenNeScalarOp,
       AtenMaskedFillTensorOp, AtenLogicalOrOp, AtenLogicalAndOp, AtenAtanOp,
       AtenAcosOp, AtenLogicalXorOp, AtenLogicalNotOp, AtenIsinfOp, AtenTriuOp,
-      AtenTrilOp, AtenRemainderScalarOp, AtenFmodTensorOp,
-      AtenRemainderTensorOp, AtenBitwiseNotOp, AtenRoundOp, AtenFillScalarOp,
-      AtenFillTensorOp, AtenRealOp, AtenImagOp, AtenDequantizeSelfOp,
-      AtenDequantizeTensorOp, AtenQuantizePerTensorOp>();
+      AtenTrilOp, AtenRemainderScalarOp, AtenRemainderTensorOp,
+      AtenBitwiseNotOp, AtenRoundOp, AtenFillScalarOp, AtenFillTensorOp,
+      AtenRealOp, AtenImagOp, AtenDequantizeSelfOp, AtenDequantizeTensorOp,
+      AtenQuantizePerTensorOp, AtenIscloseOp>();
   patterns.add<ConvertElementwiseOp>(typeConverter, context);
   target.addIllegalOp<AtenNllLossForwardOp>();
   patterns.add<ConvertAtenDetachOp>(typeConverter, context);
@@ -3281,4 +3398,6 @@ void mlir::torch::torch_to_linalg::populateUncategorizedPatternsAndLegality(
   patterns.add<ConvertInterpolateOp>(typeConverter, context);
   target.addIllegalOp<AtenLinalgDetOp>();
   patterns.add<ConvertAtenLinalgDetOp>(typeConverter, context);
+  target.addIllegalOp<AtenPolarOp>();
+  patterns.add<ConvertAtenPolarOp>(typeConverter, context);
 }
